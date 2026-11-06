@@ -172,7 +172,7 @@
         try {
           const data = JSON.parse(await f.text());
           if (!data.users || !data.users.berke || !data.users.melis) throw new Error();
-          ['berke','melis'].forEach((k) => (data.users[k].workouts || []).forEach((w) => (w.exercises || []).forEach((e) => (e.history || []).forEach((h) => { if (h.id && !/^[a-z0-9]{1,40}$/i.test(h.id)) h.id = uid(); }))));
+          ['berke','melis'].forEach((k) => (data.users[k].workouts || []).forEach((w) => (w.exercises || []).forEach((e) => (e.history || []).forEach((h) => { if (!h.id || !/^[a-z0-9]{1,40}$/i.test(h.id)) h.id = uid(); }))));
           if (!sanitize(data)) throw new Error();
           const cur = db.current; db = data; db.current = cur; save(); closeSheet(); render(); toast('Backup restored');
         } catch { toast('Invalid backup file'); }
