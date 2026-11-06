@@ -1,5 +1,5 @@
 // BMG offline worker: serves the app from cache (works with no signal), refreshes it in the background.
-const CACHE = 'bmg-app-v2';
+const CACHE = 'bmg-app-v3';
 const KEEP = ['bmg-data']; // user data cache — never delete
 const ASSETS = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png'];
 
