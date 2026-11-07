@@ -26,6 +26,14 @@
   // Writes are chained so they always land in order.
   let writing = Promise.resolve();
   function save() {
+    // A user edit: remember it needs syncing, then store locally.
+    if (db.current && db.users[db.current] && db.sync) {
+      db.users[db.current].updatedAt = Date.now(); db.sync[db.current].dirty = true; editVersion++;
+      schedulePush(); setTimeout(updateSyncBadge, 0);
+    }
+    persist();
+  }
+  function persist() {
     if (!hasCache()) return;
     const body = JSON.stringify(db);
     writing = writing.then(async () => {
@@ -98,6 +106,180 @@
     clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove('show'), 1800);
   }
 
+  // ---------- Cloud sync (Supabase) ----------
+  // Data is always saved on the phone first; it syncs to Supabase whenever there is a connection.
+  const SB_URL = 'https://lnxyijuclhnwudejnomw.supabase.co';
+  const SB_KEY = 'sb_publishable_-qGqFjIAtcCy3-UD0uApDQ_uGQRGrZP';
+  const EMAIL = { berke: 'berke@bmg-gym.app', melis: 'melis@bmg-gym.app' };
+  const syncState = { busy: false, error: null, queued: false };
+  let editVersion = 0, pushTimer = null;
+
+  function ensureMeta() {
+    db.auth = db.auth || { berke: null, melis: null };
+    db.sync = db.sync || {};
+    ['berke', 'melis'].forEach((k) => {
+      db.sync[k] = db.sync[k] || { dirty: false, last: null };
+      const u = db.users[k];
+      if (!Array.isArray(u.deleted)) u.deleted = [];
+      if (!u.updatedAt) u.updatedAt = 0;
+    });
+  }
+  const signedIn = (k) => !!(db.auth && db.auth[k] && db.auth[k].refresh_token);
+
+  async function sbFetch(path, opts = {}, token) {
+    const headers = { apikey: SB_KEY, 'Content-Type': 'application/json', ...(opts.headers || {}) };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const r = await fetch(SB_URL + path, { ...opts, headers });
+    let body = null; try { body = await r.json(); } catch (e) {}
+    if (!r.ok) { const err = new Error((body && (body.error_description || body.msg || body.message || body.error)) || `HTTP ${r.status}`); err.status = r.status; throw err; }
+    return body;
+  }
+  const keepSession = (k, s) => { db.auth[k] = { access_token: s.access_token, refresh_token: s.refresh_token, expires_at: s.expires_at || Math.floor(Date.now() / 1000) + (s.expires_in || 3600), user_id: s.user && s.user.id }; };
+  async function signIn(k, password) {
+    const s = await sbFetch('/auth/v1/token?grant_type=password', { method: 'POST', body: JSON.stringify({ email: EMAIL[k], password }) });
+    keepSession(k, s); persist();
+  }
+  async function createAccount(k, password) {
+    await sbFetch('/functions/v1/bmg-account', { method: 'POST', body: JSON.stringify({ profile: k, password }) });
+    await signIn(k, password);
+  }
+  async function accountStatus() { try { return await sbFetch('/functions/v1/bmg-account'); } catch (e) { return null; } }
+  async function token(k) {
+    const a = db.auth[k]; if (!a) throw Object.assign(new Error('Signed out'), { status: 401 });
+    if (a.expires_at - 60 > Date.now() / 1000) return a.access_token;
+    try {
+      const s = await sbFetch('/auth/v1/token?grant_type=refresh_token', { method: 'POST', body: JSON.stringify({ refresh_token: a.refresh_token }) });
+      keepSession(k, s); persist(); return s.access_token;
+    } catch (e) {
+      if (e.status === 400 || e.status === 401) { db.auth[k] = null; persist(); }
+      throw e;
+    }
+  }
+
+  // Merge two copies of one person's data. Nothing is lost: items are combined by id,
+  // deletions are remembered, and for items edited on both sides the newer copy wins.
+  function mergeList(newer = [], older = [], del, child) {
+    const out = [], seen = new Set(), olderById = new Map(older.map((x) => [x.id, x]));
+    newer.forEach((x) => {
+      if (!x || del.has(x.id) || seen.has(x.id)) return; seen.add(x.id);
+      const o = olderById.get(x.id);
+      out.push(child && o ? child(x, o) : x);
+    });
+    older.forEach((x) => { if (x && !del.has(x.id) && !seen.has(x.id)) { seen.add(x.id); out.push(x); } });
+    return out;
+  }
+  function mergeUser(a, b) {
+    if (!b) return a; if (!a) return b;
+    const [n, o] = (a.updatedAt || 0) >= (b.updatedAt || 0) ? [a, b] : [b, a];
+    const del = new Set([...(a.deleted || []), ...(b.deleted || [])]);
+    const exMerge = (x, y) => ({ ...x, history: mergeList(x.history, y.history, del) });
+    const wMerge = (x, y) => ({ ...x, exercises: mergeList(x.exercises, y.exercises, del, exMerge) });
+    return {
+      ...n,
+      workouts: mergeList(n.workouts, o.workouts, del, wMerge),
+      sessions: mergeList(n.sessions, o.sessions, del),
+      deleted: [...del].slice(-3000),
+      updatedAt: Math.max(a.updatedAt || 0, b.updatedAt || 0),
+    };
+  }
+
+  async function syncNow(k = db.current) {
+    if (!k || !signedIn(k)) return;
+    if (!navigator.onLine) { syncState.error = 'offline'; updateSyncBadge(); return; }
+    if (syncState.busy) { syncState.queued = true; return; }
+    syncState.busy = true; syncState.error = null; updateSyncBadge();
+    try {
+      const startVersion = editVersion;
+      const t = await token(k), uidv = db.auth[k].user_id;
+      const rows = await sbFetch(`/rest/v1/bmg_data?select=data,updated_at&user_id=eq.${encodeURIComponent(uidv)}`, {}, t);
+      const remote = rows && rows[0] ? rows[0].data : null;
+      if (editVersion !== startVersion) { syncState.queued = true; return; } // edited meanwhile, try again
+      const before = JSON.stringify(db.users[k]);
+      const merged = mergeUser(db.users[k], remote && remote.workouts ? remote : null);
+      const changedLocal = JSON.stringify(merged) !== before;
+      // A sheet holds references to the current objects; apply remote changes after it closes
+      if (changedLocal && k === db.current && $sheet.innerHTML) { syncState.later = true; return; }
+      const needPush = db.sync[k].dirty || !remote || JSON.stringify(merged) !== JSON.stringify(remote);
+      if (needPush) {
+        await sbFetch('/rest/v1/bmg_data?on_conflict=user_id', {
+          method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+          body: JSON.stringify({ user_id: uidv, profile: k, data: merged, updated_at: new Date().toISOString() }),
+        }, await token(k));
+      }
+      if (editVersion !== startVersion) { syncState.queued = true; return; }
+      if (changedLocal) db.users[k] = merged; // keep object identity when nothing changed
+      db.sync[k].dirty = false; db.sync[k].last = Date.now(); persist();
+      if (changedLocal && k === db.current) render();
+    } catch (e) {
+      syncState.error = e.status === 401 || !signedIn(k) ? 'signin' : navigator.onLine ? 'error' : 'offline';
+    } finally {
+      syncState.busy = false; updateSyncBadge();
+      if (syncState.queued) { syncState.queued = false; schedulePush(800); }
+      else if (syncState.later) { syncState.later = false; schedulePush(4000); }
+    }
+  }
+  function schedulePush(ms = 1500) { clearTimeout(pushTimer); pushTimer = setTimeout(() => syncNow(), ms); }
+  function syncLabel(k = db.current) {
+    if (!signedIn(k)) return 'Not signed in — saved on this phone only';
+    if (syncState.busy) return 'Syncing…';
+    if (syncState.error === 'offline' || !navigator.onLine) return db.sync[k].dirty ? 'Offline — changes will sync when you are back online' : 'Offline — up to date';
+    if (syncState.error === 'error') return 'Sync failed — will retry';
+    if (db.sync[k].dirty) return 'Waiting to sync…';
+    return db.sync[k].last ? `Synced · ${fmtClock(new Date(db.sync[k].last).toISOString())}` : 'Synced';
+  }
+  function updateSyncBadge() {
+    const a = $app.querySelector('[data-profile]');
+    if (a) a.classList.toggle('pending', !!(db.current && (db.sync[db.current].dirty || syncState.error)));
+    const l = $sheet.querySelector('[data-synclabel]'); if (l) l.textContent = syncLabel();
+  }
+  window.addEventListener('online', () => syncNow());
+  setInterval(() => { if (!document.hidden) syncNow(); }, 60000);
+
+  // ----- Sign-in sheet -----
+  async function signInSheet(k, onDone) {
+    openSheet(`<h2>${USERS[k]}</h2>
+      <p class="muted" style="margin-top:-12px" data-msg>Checking…</p>
+      <form data-form autocomplete="on">
+        <input type="text" name="username" autocomplete="username" value="${EMAIL[k]}" hidden>
+        <div class="field"><label>Password</label><input class="input" type="password" data-pw autocomplete="current-password" minlength="8" maxlength="72" placeholder="Password"></div>
+        <div class="field" data-confirm-wrap hidden><label>Repeat password</label><input class="input" type="password" data-pw2 autocomplete="new-password" maxlength="72" placeholder="Repeat password"></div>
+        <div class="sheet-actions"><button class="btn" type="submit" data-go disabled>Sign in</button><button class="btn ghost" type="button" data-cancel>Cancel</button></div>
+      </form>`, async (s) => {
+      const msg = s.querySelector('[data-msg]'), go = s.querySelector('[data-go]'), pw = s.querySelector('[data-pw]'), pw2 = s.querySelector('[data-pw2]');
+      s.querySelector('[data-cancel]').onclick = closeSheet;
+      if (!navigator.onLine) { msg.textContent = 'You are offline. Connect to the internet once to sign in on this phone.'; return; }
+      const st = await accountStatus();
+      if (!s.isConnected) return;
+      if (!st) { msg.textContent = 'Could not reach the server. Check your connection and try again.'; return; }
+      const create = !st[k];
+      if (create) {
+        msg.textContent = `First time on BMG? Create a password for ${USERS[k]} (at least 8 characters). Only ${USERS[k]} should do this.`;
+        s.querySelector('[data-confirm-wrap]').hidden = false; pw.autocomplete = 'new-password'; go.textContent = 'Create password';
+      } else msg.textContent = 'Enter your password. You stay signed in on this phone.';
+      go.disabled = false; pw.focus();
+      s.querySelector('[data-form]').onsubmit = async (ev) => {
+        ev.preventDefault();
+        const p = pw.value;
+        if (p.length < 8) { toast('Use at least 8 characters'); return; }
+        if (create && p !== pw2.value) { toast('Passwords do not match'); return; }
+        go.disabled = true; go.textContent = create ? 'Creating…' : 'Signing in…';
+        try {
+          if (create) await createAccount(k, p); else await signIn(k, p);
+          closeSheet(); onDone();
+          db.sync[k].dirty = true; persist(); syncNow(k);
+        } catch (e) {
+          go.disabled = false; go.textContent = create ? 'Create password' : 'Sign in';
+          toast(/invalid/i.test(e.message) ? 'Wrong password' : e.message || 'Sign-in failed');
+        }
+      };
+    });
+  }
+  function enterAs(k) {
+    db.current = k; ui.tab = 'workouts'; ui.workoutId = null; ui.exerciseId = null; ui.exercise = null; ui.timerWorkout = null;
+    persist(); render(); syncNow(k);
+  }
+  function openProfile(k) { if (signedIn(k)) enterAs(k); else signInSheet(k, () => { enterAs(k); toast(`Hi ${USERS[k]}`); }); }
+
   // ---------- Sheets ----------
   function openSheet(html, mount) {
     $sheet.innerHTML = `<div class="sheet-backdrop" data-close></div><div class="sheet" role="dialog" aria-modal="true"><div class="grabber"></div>${html}</div>`;
@@ -130,7 +312,7 @@
   function header(eyebrow, title, right = '') {
     return `<div class="top"><div><div class="eyebrow">${eyebrow}</div><h1 class="title">${title}</h1></div>${right}</div>`;
   }
-  const avatarBtn = () => `<button class="avatar" data-profile aria-label="Switch user">${USERS[db.current][0]}</button>`;
+  const avatarBtn = () => `<button class="avatar ${db.sync[db.current].dirty || syncState.error ? 'pending' : ''}" data-profile aria-label="Account and sync">${USERS[db.current][0]}</button>`;
   function bindAvatar() {
     const a = $app.querySelector('[data-profile]'); if (a) a.onclick = profileSheet;
   }
@@ -142,27 +324,36 @@
       <div><div class="who">Who's training?</div><div class="user-pick">
         ${Object.entries(USERS).map(([k, n]) => {
           const u = db.users[k];
-          return `<button class="user-btn" data-user="${k}"><span>${n}<small>${u.workouts.length} workouts · ${u.sessions.length} sessions</small></span><span class="arrow">→</span></button>`;
+          return `<button class="user-btn" data-user="${k}"><span>${n}<small>${signedIn(k) ? `Signed in · ${u.workouts.length} workouts · ${u.sessions.length} sessions` : 'Tap to sign in'}</small></span><span class="arrow">→</span></button>`;
         }).join('')}
       </div></div></div>`;
-    $app.querySelectorAll('[data-user]').forEach((b) => b.onclick = () => {
-      db.current = b.dataset.user; save(); ui.tab = 'workouts'; ui.workoutId = null; ui.exerciseId = null; ui.exercise = null; ui.timerWorkout = null; render();
-    });
+    $app.querySelectorAll('[data-user]').forEach((b) => b.onclick = () => openProfile(b.dataset.user));
   }
 
   function profileSheet() {
     const other = db.current === 'berke' ? 'melis' : 'berke';
     openSheet(`<h2>${USERS[db.current]}</h2>
+      <div class="sync-row"><span data-synclabel>${esc(syncLabel())}</span><button class="btn sm ghost" data-syncnow>Sync now</button></div>
       <div class="sheet-actions">
         <button class="btn" data-switch>Switch to ${USERS[other]}</button>
         <button class="btn ghost" data-out>Sign out</button>
         <button class="btn ghost" data-export>Export backup</button>
         <label class="btn ghost" style="cursor:pointer">Import backup<input type="file" accept="application/json" hidden data-import></label>
       </div>`, (s) => {
-      s.querySelector('[data-switch]').onclick = () => { db.current = other; save(); closeSheet(); ui.workoutId = null; ui.exerciseId = null; ui.exercise = null; ui.timerWorkout = null; render(); toast(`Hi ${USERS[other]}`); };
-      s.querySelector('[data-out]').onclick = () => { db.current = null; save(); closeSheet(); render(); };
+      s.querySelector('[data-syncnow]').onclick = () => { if (!signedIn(db.current)) { closeSheet(); signInSheet(db.current, () => toast('Signed in')); } else syncNow(); };
+      s.querySelector('[data-switch]').onclick = () => { closeSheet(); openProfile(other); };
+      s.querySelector('[data-out]').onclick = () => {
+        const k = db.current;
+        const doOut = () => {
+          // Signing out removes this person's data and login from this phone (it stays in the cloud).
+          db.auth[k] = null; db.users[k] = { workouts: [], sessions: [], timer: null, deleted: [], updatedAt: 0 };
+          db.sync[k] = { dirty: false, last: null }; db.current = null; persist(); render();
+        };
+        if (db.sync[k].dirty || !signedIn(k)) confirmSheet('Sign out?', signedIn(k) ? 'Some changes have not synced yet. Signing out now removes them from this phone. Connect to the internet first to keep them.' : 'This data was never synced. Signing out removes it from this phone.', 'Sign out anyway', doOut);
+        else { closeSheet(); doOut(); }
+      };
       s.querySelector('[data-export]').onclick = () => {
-        const blob = new Blob([JSON.stringify(db, null, 2)], { type: 'application/json' });
+        const blob = new Blob([JSON.stringify({ version: db.version, users: db.users }, null, 2)], { type: 'application/json' });
         const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
         a.download = `bmg-backup-${new Date().toISOString().slice(0, 10)}.json`; a.click();
         setTimeout(() => URL.revokeObjectURL(a.href), 2000);
@@ -174,7 +365,8 @@
           if (!data.users || !data.users.berke || !data.users.melis) throw new Error();
           ['berke','melis'].forEach((k) => (data.users[k].workouts || []).forEach((w) => (w.exercises || []).forEach((e) => (e.history || []).forEach((h) => { if (!h.id || !/^[a-z0-9]{1,40}$/i.test(h.id)) h.id = uid(); }))));
           if (!sanitize(data)) throw new Error();
-          const cur = db.current; db = data; db.current = cur; save(); closeSheet(); render(); toast('Backup restored');
+          ['berke', 'melis'].forEach((k) => { db.users[k] = mergeUser(db.users[k], { ...data.users[k], updatedAt: Date.now() }); db.sync[k].dirty = true; });
+          ensureMeta(); persist(); closeSheet(); render(); syncNow(); toast('Backup restored');
         } catch { toast('Invalid backup file'); }
       };
     });
@@ -223,7 +415,7 @@
       };
       const c = s.querySelector('[data-cancel]'); if (c) c.onclick = closeSheet;
       const d = s.querySelector('[data-del]'); if (d) d.onclick = () => confirmSheet('Delete workout?', `"${w.name}" and its exercises will be removed. Logged sessions stay in your history.`, 'Delete', () => {
-        me().workouts = me().workouts.filter((x) => x.id !== w.id); ui.workoutId = null; ui.exerciseId = null; save(); render(); toast('Workout deleted');
+        me().deleted.push(w.id); me().workouts = me().workouts.filter((x) => x.id !== w.id); ui.workoutId = null; ui.exerciseId = null; save(); render(); toast('Workout deleted');
       });
     });
   }
@@ -344,7 +536,7 @@
       const d = s.querySelector('[data-del]'); if (d) d.onclick = () => {
         if (e.history.length <= 1) { closeSheet(); toast('Only entry — delete the exercise instead'); return; }
         confirmSheet('Delete entry?', `${fmtKg(num(h.kg))} kg · ${num(h.sets)} × ${num(h.reps)} on ${fmtDate(h.d)} will be removed.`, 'Delete', () => {
-          e.history = e.history.filter((x) => x.id !== h.id); syncCurrent(e); save(); render(); toast('Entry deleted');
+          me().deleted.push(h.id); e.history = e.history.filter((x) => x.id !== h.id); syncCurrent(e); save(); render(); toast('Entry deleted');
         });
       };
     });
@@ -361,7 +553,7 @@
         e.name = nm; save(); closeSheet(); render(); toast('Saved');
       };
       s.querySelector('[data-del]').onclick = () => confirmSheet('Delete exercise?', `"${e.name}" and its history will be removed from this workout.`, 'Delete', () => {
-        w.exercises = w.exercises.filter((x) => x.id !== e.id); ui.exerciseId = null; save(); render(); toast('Exercise deleted');
+        me().deleted.push(e.id); w.exercises = w.exercises.filter((x) => x.id !== e.id); ui.exerciseId = null; save(); render(); toast('Exercise deleted');
       });
     });
   }
@@ -618,7 +810,7 @@
         <div class="sheet-actions"><button class="btn ghost" data-close2>Close</button><button class="btn danger" data-dl>Delete log</button></div>`, (sh) => {
         sh.querySelector('[data-close2]').onclick = closeSheet;
         sh.querySelector('[data-dl]').onclick = () => confirmSheet('Delete log?', 'This session will be removed from your progress.', 'Delete', () => {
-          u.sessions = u.sessions.filter((x) => x.id !== s.id); save(); render(); toast('Log deleted');
+          u.deleted.push(s.id); u.sessions = u.sessions.filter((x) => x.id !== s.id); save(); render(); toast('Log deleted');
         });
       });
     });
@@ -646,10 +838,12 @@
     }
   }
 
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && ui.tab === 'timer') render(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { if (ui.tab === 'timer') render(); syncNow(); } });
 
   load().then((d) => {
-    db = d; render();
+    db = d; ensureMeta();
+    if (db.current && !signedIn(db.current)) db.current = null; // must sign in once with cloud sync
+    render(); syncNow();
     try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) {}
   });
 

@@ -236,3 +236,9 @@ input, select { -webkit-appearance: none; appearance: none; }
 .break-btns button:active { background: #fff; color: #000; }
 .break-card.on .break-btns button { border-color: #000; color: #000; }
 .break-card.on .break-btns button:last-child { background: #000; color: #fff; }
+
+/* Sync */
+.avatar { position: relative; }
+.avatar.pending::after { content: ''; position: absolute; top: 1px; right: 1px; width: 9px; height: 9px; border-radius: 50%; background: #000; border: 2px solid #fff; }
+.sync-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--line); border-radius: 14px; padding: 10px 10px 10px 16px; margin: -6px 0 6px; font-size: 13px; color: var(--muted); }
+.sync-row .btn { flex: none; }
